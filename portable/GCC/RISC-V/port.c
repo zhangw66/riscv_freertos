@@ -186,7 +186,7 @@ extern void xPortStartFirstTask( void );
         __asm volatile( "csrs mie, %0" :: "r"(0x880) );
     }
     #endif /* ( configMTIME_BASE_ADDRESS != 0 ) && ( configMTIMECMP_BASE_ADDRESS != 0 ) */
-
+    //第一次切换上下文. 不是触发中断 而是a() call b() b() return first task func() 狸猫换太子.
     xPortStartFirstTask();
 
     /* Should not get here as after calling xPortStartFirstTask() only tasks

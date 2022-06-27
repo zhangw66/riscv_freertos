@@ -162,7 +162,7 @@ definitions. */
  * where the global and thread pointers are currently assumed to be constant so
  * are not saved:
  *
- * mstatus
+ * mstatus   中断返回时 硬件会用到寄存器进行恢复.
  * xCriticalNesting
  * x31
  * x30
@@ -185,40 +185,54 @@ definitions. */
  * x13
  * x12
  * x11
- * pvParameters
+ * pvParameters 函数入口参数.
  * x9
  * x8
  * x7
  * x6
  * x5
- * portTASK_RETURN_ADDRESS
- * [chip specific registers go here]
- * pxCode
+ * portTASK_RETURN_ADDRESS  函数返回地址
+ * [chip specific registers go here] 
+ * pxCode mepc 中断返回会使用.
  */
+//每一个任务初始化的时候,都会构建一个初始的上下文.
 pxPortInitialiseStack:
+    //配置mstatus寄存器.中断返回时,硬件会恢复该寄存器.
+    /*
+    0x1880   1 1000 1000 0000
+    bit3     MIE = 0b  代表当前是关中断的.
+    bit7     MPIE = 1b 离开中断后,该值会被赋予给MIE,从而开启中断.
+    bit11~12 MPP = 11b 离开中断后,恢复machine mode
+    */
     csrr t0, mstatus                    /* Obtain current mstatus value. */
     andi t0, t0, ~0x8                   /* Ensure interrupts are disabled when the stack is restored within an ISR.  Required when a task is created after the schedulre has been started, otherwise interrupts would be disabled anyway. */
     addi t1, x0, 0x188                  /* Generate the value 0x1880, which are the MPIE and MPP bits to set in mstatus. */
     slli t1, t1, 4
     or t0, t0, t1                       /* Set MPIE and MPP bits in mstatus value. */
-
+    //a0 代表第一个函数参数 StackType_t *pxTopOfStack 每个任务的栈顶指针.
     addi a0, a0, -portWORD_SIZE
+    //先压入mstatus
     store_x t0, 0(a0)                   /* mstatus onto the stack. */
     addi a0, a0, -portWORD_SIZE         /* Space for critical nesting count. */
     store_x x0, 0(a0)                   /* Critical nesting count starts at 0 for every task. */
     addi a0, a0, -(22 * portWORD_SIZE)  /* Space for registers x11-x31. */
+    //将该函数的第三个参数 作为任务的第一个参数传入.
     store_x a2, 0(a0)                   /* Task parameters (pvParameters parameter) goes into register X10/a0 on the stack. */
     addi a0, a0, -(6 * portWORD_SIZE)   /* Space for registers x5-x9. */
+    //创建的任务也是个函数,当函数体执行完后,也需要一个返回地址.可以用来执行线程结束后的析构工作.
     load_x t0, xTaskReturnAddress
     store_x t0, 0(a0)                   /* Return address onto the stack. */
     addi t0, x0, portasmADDITIONAL_CONTEXT_SIZE /* The number of chip specific additional registers. */
+    //厂商自定义的寄存器.
 chip_specific_stack_frame:              /* First add any chip specific registers to the stack frame being created. */
     beq t0, x0, 1f                      /* No more chip specific registers to save. */
     addi a0, a0, -portWORD_SIZE         /* Make space for chip specific register. */
+    //全部附默认值.
     store_x x0, 0(a0)                   /* Give the chip specific register an initial value of zero. */
     addi t0, t0, -1                     /* Decrement the count of chip specific registers remaining. */
     j chip_specific_stack_frame         /* Until no more chip specific registers. */
 1:
+    //最后存入线程的入口地址.同时a0会作为返回值返回.
     addi a0, a0, -portWORD_SIZE
     store_x a1, 0(a0)                   /* mret value (pxCode parameter) onto the stack. */
     ret
@@ -286,7 +300,10 @@ freertos_risc_v_application_interrupt_handler:
     csrr t2, mstatus    /* For viewing in the debugger only */
     j .
 /*-----------------------------------------------------------*/
-
+/*
+下边的函数 是在mtvec使用vector模式时使用的:
+单独的入口.
+ */
 .section .text.freertos_risc_v_exception_handler
 freertos_risc_v_exception_handler:
     portcontextSAVE_EXCEPTION_CONTEXT
@@ -319,18 +336,25 @@ exit_without_context_switch:
     portcontextRESTORE_CONTEXT
 /*-----------------------------------------------------------*/
 
-.section .text.freertos_risc_v_trap_handler
+.section .text.freertos_risc_v_trap_handler //中断异常总入口,使用direct mode.
 .align 8
-freertos_risc_v_trap_handler:
-    portcontextSAVE_CONTEXT_INTERNAL
+freertos_risc_v_trap_handler:   //中断函数入口.
+    portcontextSAVE_CONTEXT_INTERNAL    //先将被中断时的上下文保存了.
 
-    csrr a0, mcause
-    csrr a1, mepc
+    csrr a0, mcause         //获取中断原因.
+    csrr a1, mepc           //记录异常发生时pc的值.
+    /*
+    mcause最高位是符号位(异常时为0,中断为1) x0是常量值0 
+    大于0代表异常  synchronous interrupt
+     小于0代表中断 asynchronous interrupt
+    */
+    bge a0, x0, synchronous_exception 
 
-    bge a0, x0, synchronous_exception
-
-asynchronous_interrupt:
+asynchronous_interrupt:    //中断CLINT
+    /*store_x 是ld lw的封装 根据cpu总线宽度决定.*/
+    //将mepc 存入到栈中 用于返回中断发生前的位置.
     store_x a1, 0( sp )                 /* Asynchronous interrupt so save unmodified exception return address. */
+    //将sp指向中断专用的stack.
     load_x sp, xISRStackTop             /* Switch to ISR stack. */
     j handle_interrupt
 
@@ -344,27 +368,35 @@ handle_interrupt:
 #if( portasmHAS_MTIME != 0 )
 
     test_if_mtimer:                     /* If there is a CLINT then the mtimer is used to generate the tick interrupt. */
+        //下边三行判断是否是machine timer irq.
         addi t0, x0, 1
         slli t0, t0, __riscv_xlen - 1   /* LSB is already set, shift into MSB.  Shift 31 on 32-bit or 63 on 64-bit cores. */
         addi t1, t0, 7                  /* 0x8000[]0007 == machine timer interrupt. */
+        //不是machine timer irq 则跳转到application_interrupt_handler
         bne a0, t1, application_interrupt_handler
-
+        //更新寄存器,riscv的mtime不能autoload,只能manually load.
         portUPDATE_MTIMER_COMPARE_REGISTER
+        //调用rtos api，如果返回值不为0 代表需要切换上下文.
         call xTaskIncrementTick
         beqz a0, processed_source       /* Don't switch context if incrementing tick didn't unblock a task. */
+        //切换上下文.就是选择当前使用哪个TCB,并更新全局变量pxCurrentTCB.
         call vTaskSwitchContext
         j processed_source
 
 #endif /* portasmHAS_MTIME */
 
 application_interrupt_handler:
+    //该函数可以被重写.
     call freertos_risc_v_application_interrupt_handler
     j processed_source
 
 handle_exception:
     /* a0 contains mcause. */
+    //将立即数加载到t0寄存器.
     li t0, 11                                   /* 11 == environment call. */
+    //如果是11号异常,代表是machine mode发起的ecall.
     bne a0, t0, application_exception_handler   /* Not an M environment call, so some other exception. */
+    //切换上下文.
     call vTaskSwitchContext
     j processed_source
 

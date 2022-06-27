@@ -48,6 +48,7 @@
  * portasmRESTORE_ADDITIONAL_REGISTERS macros - which can be defined in a chip
  * specific version of freertos_risc_v_chip_specific_extensions.h.  See the
  * notes at the top of portASM.S file. */
+//除了x0 这个永远是0的寄存器 剩下的还有31个寄存器.
 #define portCONTEXT_SIZE ( 31 * portWORD_SIZE )
 /*-----------------------------------------------------------*/
 
@@ -56,10 +57,18 @@
 .extern xCriticalNesting
 .extern pxCriticalNesting
 /*-----------------------------------------------------------*/
-
+/*
+当发生中断的时候,首先会调用这个函数.
+该函数就是将线程上下文保存全部保存到线程栈.
+并更新tcb中的pxTopOfStack指针.
+*/
 .macro portcontextSAVE_CONTEXT_INTERNAL
-    addi sp, sp, -portCONTEXT_SIZE
-    store_x x1, 1 * portWORD_SIZE( sp )
+    addi sp, sp, -portCONTEXT_SIZE   //将sp减小31个寄存器的大小.
+    store_x x1, 1 * portWORD_SIZE( sp ) //0(sp)==>offset(addr) 类似与数组的使用. 将x1存入栈中.
+    /*
+    x2 x3 x4分别是stack pointer global pointer thread pointer.
+    不存x2,x3,x4.
+    */
     store_x x5, 2 * portWORD_SIZE( sp )
     store_x x6, 3 * portWORD_SIZE( sp )
     store_x x7, 4 * portWORD_SIZE( sp )
@@ -87,15 +96,19 @@
     store_x x29, 26 * portWORD_SIZE( sp )
     store_x x30, 27 * portWORD_SIZE( sp )
     store_x x31, 28 * portWORD_SIZE( sp )
-
+    //存储当前中断嵌套的层数.
     load_x  t0, xCriticalNesting         /* Load the value of xCriticalNesting into t0. */
     store_x t0, 29 * portWORD_SIZE( sp ) /* Store the critical nesting value to the stack. */
-
+    //存入mstatus.
     csrr t0, mstatus                     /* Required for MPIE bit. */
     store_x t0, 30 * portWORD_SIZE( sp )
-
+    //存入自定义的寄存器.
     portasmSAVE_ADDITIONAL_REGISTERS     /* Defined in freertos_risc_v_chip_specific_extensions.h to save any registers unique to the RISC-V implementation. */
-
+    /*
+    将sp值更新到,pxCurrentTCB->pxTopOfStack
+    volatile StackType_t * pxTopOfStack; 
+    < Points to the location of the last item placed on the tasks stack.
+    */
     load_x  t0, pxCurrentTCB             /* Load pxCurrentTCB. */
     store_x  sp, 0( t0 )                 /* Write sp to first TCB member. */
 
@@ -120,13 +133,17 @@
     load_x sp, xISRStackTop             /* Switch to ISR stack. */
     .endm
 /*-----------------------------------------------------------*/
-
+//将栈指针和上下文恢复到中断发生前的值.
 .macro portcontextRESTORE_CONTEXT
+    //拿到当前进程上下文的指针.
     load_x  t1, pxCurrentTCB                /* Load pxCurrentTCB. */
-        load_x  sp, 0( t1 )                 /* Read sp from first TCB member. */
+    //赋值给sp寄存器.
+    load_x  sp, 0( t1 )                 /* Read sp from first TCB member. */
 
     /* Load mepc with the address of the instruction in the task to run next. */
+    //进入中断的时候将mepc存到了栈顶.
     load_x t0, 0( sp )
+    //重新更新mepc.
     csrw mepc, t0
 
     /* Defined in freertos_risc_v_chip_specific_extensions.h to restore any registers unique to the RISC-V implementation. */
@@ -169,7 +186,13 @@
     load_x  x30, 27 * portWORD_SIZE( sp )
     load_x  x31, 28 * portWORD_SIZE( sp )
     addi sp, sp, portCONTEXT_SIZE
-
+    /*
+    At this point control is handed over to software where the interrupt processing begins. At the
+    end of the interrupt handler, the mret instruction will do the following.
+    • Restore mepc to pc
+    • Restore mstatus.mpp to Priv
+    • Restore mstatus.mpie to mie
+    */
     mret
     .endm
 /*-----------------------------------------------------------*/
